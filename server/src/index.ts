@@ -41,19 +41,23 @@ import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/e
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
   feedbackService,
+  applyManagedEnvironments,
   backfillPrincipalAccessCompatibility,
   backfillLegacyToolOAuthTokens,
   bootstrapExecutionPolicyFromEnv,
   environmentCustomImageService,
   heartbeatService,
+  issueService,
   instanceSettingsService,
   reconcileBuiltInAgentsOnStartup,
   reconcileCloudUpstreamRunsOnStartup,
   reconcileCodexLocalManagedHomesOnStartup,
   reconcilePersistedRuntimeServicesOnStartup,
   routineService,
+  statusCardService,
   toolAccessService,
 } from "./services/index.js";
+import { queueIssueAssignmentWakeup } from "./services/issue-assignment-wakeup.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
 import {
   parseAdapterRegistryEnv,
@@ -825,7 +829,13 @@ export async function startServer(): Promise<StartedServer> {
 
   void reconcileBuiltInAgentsOnStartup(db as any)
     .then((result) => {
-      if (result.reconciled > 0 || result.unknown > 0 || result.duplicates > 0 || result.autoEnsured > 0) {
+      if (
+        result.reconciled > 0
+        || result.unknown > 0
+        || result.duplicates > 0
+        || result.autoEnsured > 0
+        || result.companyFailures > 0
+      ) {
         logger.warn(
           result,
           "startup reconciliation of built-in agents complete",
@@ -857,6 +867,31 @@ export async function startServer(): Promise<StartedServer> {
     throw err;
   }
 
+  // Ensure sandbox environments declared in the managed-config document
+  // (`environments` section) before the heartbeat resumes queued runs. The
+  // document already parsed fail-closed above; the ensure step itself is
+  // fail-safe per entry (a degraded boot beats a fleet-wide crash loop), but
+  // a contradictory deployment that also forces PAPERCLIP_EXECUTION_MODE
+  // throws here and fails startup. `pluginsReady` sequences the ensure after
+  // the bundled-plugin install/load pass so a declared environment never
+  // activates before its provider driver is registered; the worker manager
+  // additionally gates each entry on a live plugin worker (and archives the
+  // row of a provider that did not come up).
+  try {
+    const bundledPluginsStartup = (app as { locals?: { bundledPluginsStartup?: Promise<unknown> } })
+      .locals?.bundledPluginsStartup;
+    const managedEnvironmentsResult = await applyManagedEnvironments(db as any, managedConfig, {
+      pluginsReady: bundledPluginsStartup,
+      workerManager: pluginWorkerManager,
+    });
+    if (managedEnvironmentsResult) {
+      logger.warn(managedEnvironmentsResult, "managed sandbox environments ensured from managed config");
+    }
+  } catch (err) {
+    logger.error({ err }, "failed to apply managed environments from managed config");
+    throw err;
+  }
+
   let drainHeartbeatRunsForShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<unknown>) | null = null;
   let prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<{ skipDrain: boolean }>) | null = null;
   let heartbeatSchedulerStopped = false;
@@ -883,6 +918,8 @@ export async function startServer(): Promise<StartedServer> {
     prepareHotRestartShutdown = heartbeat.prepareHotRestartShutdown;
     const environmentCustomImages = environmentCustomImageService(db as any, { pluginWorkerManager });
     const routines = routineService(db as any, { pluginWorkerManager });
+    const statusCards = statusCardService(db as any);
+    const issues = issueService(db as any);
     const tools = toolAccessService(db as any, {
       deploymentMode: config.deploymentMode,
       deploymentExposure: config.deploymentExposure,
@@ -1048,6 +1085,35 @@ export async function startServer(): Promise<StartedServer> {
           .catch((err) => {
             logger.error({ err }, "routine scheduler tick failed");
           }));
+
+        if (heartbeatSchedulerStopped) return;
+        trackHeartbeatSchedulerWork((async () => {
+          const experimental = await instanceSettingsService(db).getExperimental();
+          if (experimental.enableStatusCards !== true) return;
+          const result = await statusCards.tickDueStatusCards(new Date());
+          await Promise.all(result.enqueued.map(async ({ cardId, generatingIssue }) => {
+            try {
+              await queueIssueAssignmentWakeup({
+                heartbeat,
+                issue: generatingIssue,
+                reason: "status_card_update_assigned",
+                mutation: "status_card.scheduler_update_requested",
+                contextSource: "status_card_scheduler",
+                requestedByActorType: "system",
+                taskKey: `status-card:${cardId}`,
+                rethrowOnError: true,
+              });
+            } catch (err) {
+              await issues.update(generatingIssue.id, { status: "cancelled" });
+              throw err;
+            }
+          }));
+          if (result.evaluated > 0 || result.enqueued.length > 0) {
+            logger.info({ evaluated: result.evaluated, enqueued: result.enqueued.length }, "status-card scheduler tick complete");
+          }
+        })().catch((err) => {
+          logger.error({ err }, "status-card scheduler tick failed");
+        }));
 
         if (heartbeatSchedulerStopped) return;
         trackHeartbeatSchedulerWork(environmentCustomImages
