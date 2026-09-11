@@ -143,6 +143,25 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     });
   });
 
+  it("refreshes the selected run detail after lifecycle events", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+    };
+
+    __liveUpdatesTestUtils.invalidateHeartbeatQueries(
+      queryClient as never,
+      "company-1",
+      { runId: "run-1", agentId: "agent-1" },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.runDetail("run-1"),
+    });
+  });
+
   it("applies heartbeat progress payloads directly to cached visible issue runs", () => {
     const cache = new Map<string, unknown>([
       [JSON.stringify(queryKeys.liveRuns("company-1")), [{ id: "run-1", currentStatusMessage: null }]],
@@ -650,6 +669,58 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     });
   });
 
+  it("actively refreshes interactions materialized by a visible native status decision", () => {
+    const invalidations: unknown[] = [];
+    const queryClient = {
+      invalidateQueries: (input: unknown) => {
+        invalidations.push(input);
+      },
+      getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
+          return {
+            id: "issue-1",
+            identifier: "PAP-759",
+            assigneeAgentId: "agent-1",
+          };
+        }
+        return undefined;
+      },
+    };
+
+    __liveUpdatesTestUtils.invalidateActivityQueries(
+      queryClient as never,
+      "company-1",
+      {
+        entityType: "issue",
+        entityId: "issue-1",
+        action: "issue.updated",
+        actorType: "system",
+        actorId: "native-status-committer",
+        details: {
+          identifier: "PAP-759",
+          source: "native_status_decision",
+          toStatus: "in_review",
+          reasonCode: "external_verification_required",
+          effectCount: 2,
+        },
+      },
+      { userId: null, agentId: null },
+      { pathname: "/PAP/issues/PAP-759", isForegrounded: true },
+    );
+
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.issues.detail("issue-1"),
+      refetchType: "inactive",
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.issues.interactions("issue-1"),
+    });
+    expect(invalidations).not.toContainEqual({
+      queryKey: queryKeys.issues.interactions("issue-1"),
+      refetchType: "inactive",
+    });
+  });
+
   it("keeps visible issue comment updates inactive-only instead of active refetching", () => {
     const invalidations: unknown[] = [];
     const queryClient = {
@@ -775,6 +846,14 @@ describe("LiveUpdatesProvider issue invalidation", () => {
     expect(invalidations).toContainEqual({
       queryKey: queryKeys.issues.activeRun("issue-1"),
     });
+    // A native finalizer can persist its selected response without a separate
+    // comment_added event. Terminal refresh must pick up that canonical reply.
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.issues.comments("PAP-759"),
+    });
+    expect(invalidations).toContainEqual({
+      queryKey: queryKeys.issues.comments("issue-1"),
+    });
     expect(cache.get(JSON.stringify(queryKeys.issues.activeRun("PAP-759")))).toBeNull();
     expect(cache.get(JSON.stringify(queryKeys.issues.liveRuns("PAP-759")))).toEqual([]);
     expect(cache.get(JSON.stringify(queryKeys.issues.detail("PAP-759")))).toMatchObject({
@@ -790,6 +869,34 @@ describe("LiveUpdatesProvider issue invalidation", () => {
       executionLockedAt: null,
     });
   });
+
+  it.each(["running", "queued", undefined])(
+    "does not refetch comments on nonterminal run progress: %s",
+    (status) => {
+      const invalidations: unknown[] = [];
+      const queryClient = {
+        invalidateQueries: (input: unknown) => invalidations.push(input),
+        getQueryData: (key: unknown) => {
+          if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
+            return { id: "issue-1", identifier: "PAP-759", assigneeAgentId: "agent-1" };
+          }
+          if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.activeRun("PAP-759"))) {
+            return { id: "run-1" };
+          }
+          return undefined;
+        },
+      };
+      expect(__liveUpdatesTestUtils.invalidateVisibleIssueRunQueries(
+        queryClient as never,
+        "/PAP/issues/PAP-759",
+        { runId: "run-1", agentId: "agent-1", status },
+        { isForegrounded: true },
+      )).toBe(true);
+      for (const ref of ["PAP-759", "issue-1"]) {
+        expect(invalidations).not.toContainEqual({ queryKey: queryKeys.issues.comments(ref) });
+      }
+    },
+  );
 
   it("ignores run status events for other issues", () => {
     const invalidations: unknown[] = [];
@@ -975,6 +1082,7 @@ describe("LiveUpdatesProvider visible issue toast suppression", () => {
   it("suppresses run and agent status toasts for the assignee of the visible issue", () => {
     const queryClient = {
       getQueryData: (key: unknown) => {
+        if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.activeRun("PAP-759"))) return { id: "run-1" };
         if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-759"))) {
           return {
             id: "issue-1",
@@ -1084,12 +1192,89 @@ describe("LiveUpdatesProvider run lifecycle toasts", () => {
       tone: "error",
     });
   });
+
+  it("turns an unlinked chat isolation precondition into one actionable warning without an agent UUID", () => {
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-low-trust",
+          agentId: "31f56712-3944-423e-b7c7-404bb8fbb993",
+          status: "failed",
+          error: "Low-trust execution requires isolated workspaces to be enabled.",
+          errorCode: "low_trust_isolation_unavailable",
+          contextSource: "chat:slack",
+        },
+        () => "Maya E2E",
+      ),
+    ).toEqual({
+      title: "Maya E2E couldn't start this chat",
+      body: "This external chat identity isn't linked, and isolated guest workspaces are disabled. Link the identity in Connectors or enable isolated workspaces, then start a new task.",
+      tone: "warn",
+      ttlMs: 10_000,
+      action: { label: "Open chat connections", href: "/apps" },
+      dedupeKey: "run-status:run-low-trust:failed",
+    });
+
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-low-trust-uncached",
+          agentId: "31f56712-3944-423e-b7c7-404bb8fbb993",
+          status: "failed",
+          errorCode: "low_trust_isolation_unavailable",
+          contextSource: "chat:slack",
+        },
+        () => null,
+      )?.title,
+    ).toBe("Agent couldn't start this chat");
+  });
+
+  it("keeps non-chat and genuine runtime failures on the ordinary error path", () => {
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-low-trust-board",
+          agentId: "agent-1",
+          status: "failed",
+          error: "Low-trust execution requires isolated workspaces to be enabled.",
+          errorCode: "low_trust_isolation_unavailable",
+          contextSource: "issue.assignment",
+        },
+        () => "CodexCoder",
+      ),
+    ).toMatchObject({
+      title: "CodexCoder run failed",
+      tone: "error",
+      action: { label: "View run" },
+    });
+
+    expect(
+      __liveUpdatesTestUtils.buildRunStatusToast(
+        {
+          runId: "run-adapter-failure",
+          agentId: "agent-1",
+          status: "failed",
+          error: "Adapter process exited",
+          errorCode: "adapter_failed",
+          contextSource: "chat:slack",
+        },
+        () => "CodexCoder",
+      ),
+    ).toMatchObject({
+      title: "CodexCoder run failed",
+      body: "Adapter process exited",
+      tone: "error",
+      action: { label: "View run" },
+    });
+  });
 });
 
 describe("applyRunLifecycleToCompanyLiveRuns", () => {
   function makeClient(initial: Array<{ id: string; status: string }>) {
+    const initialDetail = initial.find((run) => run.id === "run-1");
     const cache = new Map<string, unknown>([
       [JSON.stringify(queryKeys.liveRuns("company-1")), initial],
+      [JSON.stringify(queryKeys.runDetail("run-1")), initialDetail],
     ]);
     const client = {
       getQueryData: (key: unknown) => cache.get(JSON.stringify(key)),
@@ -1100,18 +1285,31 @@ describe("applyRunLifecycleToCompanyLiveRuns", () => {
       },
     };
     const read = () => cache.get(JSON.stringify(queryKeys.liveRuns("company-1")));
-    return { client, read };
+    const readDetail = () => cache.get(JSON.stringify(queryKeys.runDetail("run-1")));
+    return { client, read, readDetail };
   }
 
   it("removes a run on a terminal status (patched, no refetch needed)", () => {
-    const { client, read } = makeClient([{ id: "run-1", status: "running" }, { id: "run-2", status: "running" }]);
+    const { client, read, readDetail } = makeClient([{ id: "run-1", status: "running" }, { id: "run-2", status: "running" }]);
     const patched = __liveUpdatesTestUtils.applyRunLifecycleToCompanyLiveRuns(
       client as never,
       "company-1",
-      { runId: "run-1", status: "succeeded" },
+      {
+        runId: "run-1",
+        status: "succeeded",
+        finishedAt: "2026-07-24T10:00:00.000Z",
+        error: null,
+        errorCode: null,
+      },
     );
     expect(patched).toBe(true);
     expect(read()).toEqual([{ id: "run-2", status: "running" }]);
+    expect(readDetail()).toEqual(expect.objectContaining({
+      status: "succeeded",
+      finishedAt: "2026-07-24T10:00:00.000Z",
+      error: null,
+      errorCode: null,
+    }));
   });
 
   it("patches status in place for a run already in the list", () => {
@@ -1123,6 +1321,30 @@ describe("applyRunLifecycleToCompanyLiveRuns", () => {
     );
     expect(patched).toBe(true);
     expect(read()).toEqual([{ id: "run-1", status: "running" }]);
+  });
+
+  it("patches the selected run detail when a queued run starts", () => {
+    const { client, readDetail } = makeClient([{ id: "run-1", status: "queued" }]);
+
+    __liveUpdatesTestUtils.applyRunLifecycleToCompanyLiveRuns(
+      client as never,
+      "company-1",
+      {
+        runId: "run-1",
+        status: "running",
+        startedAt: "2026-07-24T09:59:00.000Z",
+        error: null,
+        errorCode: null,
+      },
+    );
+
+    expect(readDetail()).toEqual(expect.objectContaining({
+      id: "run-1",
+      status: "running",
+      startedAt: "2026-07-24T09:59:00.000Z",
+      error: null,
+      errorCode: null,
+    }));
   });
 
   it("reports not-patched for a genuinely new run so the caller refetches", () => {
@@ -1287,5 +1509,32 @@ describe("dispatchLiveEventToSubscribers", () => {
       ),
     ).not.toThrow();
     expect(received).toEqual(["still-called"]);
+  });
+});
+
+describe("task subtree notification context", () => {
+  const root = { id: "root", companyId: "company", identifier: "PAP-204", assigneeAgentId: "parent-agent" };
+  const descendants = [{ id: "child", identifier: "PAP-205", assigneeAgentId: "child-agent", executionRunId: "child-run" }];
+  const queryClient = {
+    getQueryData: (key: unknown) => {
+      if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.detail("PAP-204"))) return root;
+      if (JSON.stringify(key) === JSON.stringify(queryKeys.issues.listByDescendantRoot("company", "root"))) return descendants;
+    },
+  };
+  it("suppresses descendant cancellation and activity on the visible subtree", () => {
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { runId: "child-run", agentId: "child-agent", status: "cancelled" }, { isForegrounded: true })).toBe(true);
+    expect(__liveUpdatesTestUtils.shouldSuppressActivityToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { entityType: "issue", entityId: "child" }, { isForegrounded: true })).toBe(true);
+  });
+  it("uses the event task when a terminal run has already left the cache", () => {
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { issueId: "root", runId: "finished-run" }, { isForegrounded: true })).toBe(true);
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { issueId: "unrelated", runId: "child-run", agentId: "child-agent" }, { isForegrounded: true })).toBe(false);
+  });
+  it("retains notifications for unrelated tasks and background pages", () => {
+    for (const [agentId, foregrounded] of [["other-agent", true], ["child-agent", true], ["child-agent", false]] as const) {
+      expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/issues/PAP-204", { agentId, runId: "another-run", status: "cancelled" }, { isForegrounded: foregrounded })).toBe(false);
+    }
+  });
+  it("suppresses the run shown on its own run detail page", () => {
+    expect(__liveUpdatesTestUtils.shouldSuppressRunStatusToastForVisibleIssue(queryClient as never, "/PAP/agents/alex/runs/child-run", { runId: "child-run" }, { isForegrounded: true })).toBe(true);
   });
 });
