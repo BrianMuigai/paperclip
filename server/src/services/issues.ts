@@ -1,19 +1,31 @@
+import { recordChatHandoff, recordChatCompletion, existingChatCompletionReply, acknowledgeChatCompletionReply } from "./chat-completion-delivery.js";
+import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
+import { assertAgentRunWriteAllowed } from "../agent-run-cancellation.js";
+import { retryIdempotentDatabaseOperation } from "../database-retry.js";
+import { externalConversationStateSql, nonIdleSlackIssueCondition, resumeSlackConversation } from "./slack-conversation-state.js";
+import { documentService } from "./documents.js";
+import { parseTaskSearch, taskSearchCtes, taskSearchScore } from "./task-search.js";
+import { createdFromIssueCondition } from "./issue-creation-origin.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import type { ExecutionProjection } from "@paperclipai/shared";
 import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
+import { isExplicitContinuationRetryClaim } from "./explicit-continuation-retry-claim.js";
+import { markdownToPlainText, parseMarkdown } from "chat";
 import {
   and,
   asc,
   desc,
   eq,
   gt,
+  getTableColumns,
   gte,
   inArray,
   isNotNull,
   isNull,
   like,
   lt,
+  lte,
   ne,
   notExists,
   notInArray,
@@ -44,6 +56,7 @@ import {
   routineRuns,
   executionWorkspaces,
   issueApprovals,
+  issueAccessGrants,
   issueAttachments,
   issueCreateIdempotencyKeys,
   issueInboxArchives,
@@ -59,6 +72,8 @@ import {
   issueReadStates,
   issueThreadInteractions,
   toolActionRequests,
+  toolActionDeliveries,
+  toolInvocations,
   issues,
   labels,
   projectWorkspaces,
@@ -78,8 +93,6 @@ import type {
   IssueReviewAttentionPath,
   IssueBlockedInboxAttention,
   IssueBlockedInboxIssueRef,
-  IssueProductivityReview,
-  IssueProductivityReviewTrigger,
   IssueRelationIssueSummary,
   IssueWatchdogSummary,
   LowTrustBoundary,
@@ -186,6 +199,7 @@ import {
   type ActivityPublication,
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
+import { ensurePersonalPrivateProject } from "./projects.js";
 import { projectSafeChatPublication } from "./chat-publication-projection.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
@@ -224,6 +238,7 @@ const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES = 2_000_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES = 256_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_END_SLACK_MS = 60_000;
 const ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_PARALLEL_READS = 8;
+const ISSUE_COMMENT_RUN_LOG_DERIVATION_TIMEOUT_MS = 3_000;
 export const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS = 7;
 const ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS =
   ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS * 24 * 60 * 60 * 1000;
@@ -1113,6 +1128,10 @@ export async function resolveChatOriginPublicationBindings(
   runId: string | null,
 ): Promise<ChatPublicationBinding[]> {
   if (!runId) return [];
+  const explicitEmail = await dbOrTx.select({ id: chatEndpoints.id }).from(chatEndpoints)
+    .innerJoin(chatConversations, eq(chatConversations.endpointId, chatEndpoints.id))
+    .where(and(eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issueId), eq(chatEndpoints.publicationMode, "explicit"))).limit(1);
+  if (explicitEmail.length) return [];
 
   let originRunId = runId;
   let contextSnapshot: Record<string, unknown> | null = null;
@@ -1124,6 +1143,7 @@ export async function resolveChatOriginPublicationBindings(
     const run = await dbOrTx
       .select({
         agentId: heartbeatRuns.agentId,
+        responsibleUserId: heartbeatRuns.responsibleUserId,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -1137,6 +1157,7 @@ export async function resolveChatOriginPublicationBindings(
         (
           rows: Array<{
             agentId: string;
+            responsibleUserId: string | null;
             contextSnapshot: Record<string, unknown> | null;
           }>,
         ) => rows[0] ?? null,
@@ -1150,6 +1171,12 @@ export async function resolveChatOriginPublicationBindings(
       readStringFromRecord(snapshot, "issueId") ??
       readStringFromRecord(snapshot, "taskId");
     if (snapshotIssueId && snapshotIssueId !== issueId) return [];
+
+    const boardBindings = await slackBoardReplyBindings(dbOrTx, {
+      companyId, issueId, agentId: lineageAgentId!,
+      commentIds: readChatWakeCommentIds(snapshot), userId: run.responsibleUserId,
+    });
+    if (boardBindings.length) return boardBindings;
 
     // A native runner can emit its continuation immediately after the durable
     // `request.resolve` command is queued, before the delivery worker records
@@ -1295,6 +1322,51 @@ export async function resolveChatOriginPublicationBindings(
     }
 
     const contextSource = readStringFromRecord(snapshot, "source");
+    if (contextSource === "tool_action_review") {
+      // Review results use their own durable wake, not the ordinary interaction
+      // response key. Attest the entire batch before following its origin; the
+      // model's context/sourceRunId alone never grants publication authority.
+      const [wake] = await dbOrTx.select({ payload: agentWakeupRequests.payload,
+        idempotencyKey: agentWakeupRequests.idempotencyKey })
+        .from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, lineageAgentId!),
+          eq(agentWakeupRequests.runId, originRunId),
+          like(agentWakeupRequests.idempotencyKey, "tool-action-response:%"),
+        )).limit(1);
+      const requestIds = wake?.payload?.toolActionRequestIds;
+      const sourceRunId = readStringFromRecord(snapshot, "sourceRunId");
+      if (!Array.isArray(requestIds) || requestIds.length === 0 ||
+        requestIds.some((id: unknown) => typeof id !== "string" || !isUuidLike(id)) ||
+        !sourceRunId || !isUuidLike(sourceRunId) || sourceRunId !== wake.payload.sourceRunId ||
+        wake.idempotencyKey !== `tool-action-response:${requestIds[0]}` ||
+        snapshot.interactionId !== wake.payload.interactionId) return [];
+      const receipts = await dbOrTx.select({ id: toolActionRequests.id })
+        .from(toolActionRequests)
+        .innerJoin(toolInvocations, and(
+          eq(toolInvocations.id, toolActionRequests.invocationId),
+          eq(toolInvocations.companyId, companyId),
+          eq(toolInvocations.issueId, issueId),
+          eq(toolInvocations.agentId, lineageAgentId!),
+          eq(toolInvocations.runId, sourceRunId),
+        ))
+        .innerJoin(toolActionDeliveries, and(
+          eq(toolActionDeliveries.actionRequestId, toolActionRequests.id),
+          eq(toolActionDeliveries.companyId, companyId),
+          eq(toolActionDeliveries.issueId, issueId),
+          eq(toolActionDeliveries.interactionId, toolActionRequests.interactionId),
+        ))
+        .where(and(
+          eq(toolActionRequests.companyId, companyId),
+          eq(toolActionRequests.issueId, issueId),
+          eq(toolActionRequests.requestedByAgentId, lineageAgentId!),
+          inArray(toolActionRequests.id, requestIds),
+          inArray(toolActionRequests.status, ["executed", "failed", "rejected", "expired", "cancelled"]),
+        ));
+      if (receipts.length !== requestIds.length) return [];
+      originRunId = sourceRunId;
+      continue;
+    }
     if (contextSource?.startsWith("chat:")) {
       contextSnapshot = snapshot;
       break;
@@ -1748,6 +1820,7 @@ export interface IssueFilters {
   executionWorkspaceId?: string;
   parentId?: string;
   descendantOf?: string;
+  createdFromIssueId?: string;
   labelId?: string;
   originKind?: string;
   originKindPrefix?: string;
@@ -1760,16 +1833,18 @@ export interface IssueFilters {
   includeLiveDescendantSummary?: boolean;
   hasPlanDocument?: boolean;
   lowTrustBoundary?: LowTrustBoundary & { companyId: string };
+  readCondition?: SQL<boolean>;
   q?: string;
   limit?: number;
   offset?: number;
-  sortField?: "updated";
+  sortField?: "updated" | "id";
+  afterId?: string;
   sortDir?: "asc" | "desc";
   /** ISO 8601 timestamp — only return issues with updatedAt strictly after this value. */
   updatedSince?: string;
 }
 
-type IssueRow = typeof issues.$inferSelect;
+type IssueRow = typeof issues.$inferSelect & { externalConversationState?: "active" | "waiting" | null };
 type IssueLabelRow = typeof labels.$inferSelect;
 type IssuePlanDecompositionRow = typeof issuePlanDecompositions.$inferSelect;
 type IssueActiveRunRow = {
@@ -1852,8 +1927,18 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+/** Conversation containers cannot acquire new child edges, even with the experiment disabled. */
+async function assertExecutionTaskParent(db: Db, companyId: string, parentId?: string | null) {
+  if (!parentId) return;
+  const [parent] = await db.select({ conversationAgentId: issues.conversationAgentId })
+    .from(issues).where(and(eq(issues.id, parentId), eq(issues.companyId, companyId)));
+  if (parent?.conversationAgentId) throw unprocessable("Conversations cannot have new subtasks; create a task in a project instead");
+}
+
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
+type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId" | "title" | "titleNeedsGeneration"> & {
+  title?: string;
+  initialPlan?: string | null;
   labelIds?: string[];
   blockedByIssueIds?: string[];
   inheritExecutionWorkspaceFromIssueId?: string | null;
@@ -1865,6 +1950,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   trustExplicitResponsibleUserId?: boolean;
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
+  assertCanReuseIssue?: (issue: typeof issues.$inferSelect) => Promise<void>;
   onDeduplicated?: (reason: "idempotency_key" | "recent_open_title") => void;
 };
 type IssueChildCreateInput = IssueCreateInput & {
@@ -3112,6 +3198,7 @@ function issueListOrderBy(
     sortDir?: IssueFilters["sortDir"];
   },
 ) {
+  if (sortField === "id") return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
   const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
   if (sortField === "updated") {
     const activityOrder =
@@ -3234,15 +3321,6 @@ const BLOCKER_ATTENTION_PENDING_APPROVAL_STATUSES = [
 const BLOCKER_ATTENTION_OPEN_RECOVERY_ORIGIN_KIND =
   "harness_liveness_escalation";
 const BLOCKER_ATTENTION_CHILD_TERMINAL_STATUSES = ["done", "cancelled"];
-const PRODUCTIVITY_REVIEW_ORIGIN_KIND = "issue_productivity_review";
-const PRODUCTIVITY_REVIEW_TERMINAL_STATUSES = ["done", "cancelled"];
-const PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS = [
-  "issue.productivity_review_created",
-  "issue.productivity_review_updated",
-];
-const PRODUCTIVITY_REVIEW_TRIGGERS: readonly IssueProductivityReviewTrigger[] =
-  ["no_comment_streak", "long_active_duration", "high_churn"];
-
 function lowTrustBoundaryIssueCondition(
   companyId: string,
   boundary: (LowTrustBoundary & { companyId: string }) | null | undefined,
@@ -3528,6 +3606,84 @@ function summarizeIssueRelationRow(
   };
 }
 
+/** Inline draft images become task attachments in the same transaction as publication. */
+async function attachOwnedDraftImages(tx: DbTransaction, issue: typeof issues.$inferSelect, body: string | null | undefined,
+  actor: { userId?: string | null; agentId?: string | null }) {
+  const ids = [...new Set(Array.from((body ?? "").matchAll(/\/api\/assets\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/content/gi), match => match[1]!))];
+  if (!ids.length || (!actor.userId && !actor.agentId)) return;
+  const owned = await tx.select().from(assets).where(and(eq(assets.companyId, issue.companyId), inArray(assets.id, ids),
+    actor.userId ? eq(assets.createdByUserId, actor.userId) : eq(assets.createdByAgentId, actor.agentId!)));
+  for (const asset of owned) {
+    if (!asset.objectKey.startsWith(`${issue.companyId}/assets/issues/drafts/`)) continue;
+    await tx.insert(issueAttachments).values({ companyId: issue.companyId, issueId: issue.id, assetId: asset.id }).onConflictDoNothing();
+  }
+}
+
+export async function ensureAssignmentIssueAccessGrant(
+  dbOrTx: any,
+  issue: typeof issues.$inferSelect,
+  previous: Pick<typeof issues.$inferSelect, "assigneeAgentId" | "assigneeUserId" | "visibility"> | null,
+  actor: { agentId?: string | null; userId?: string | null },
+) {
+  if (issue.visibility !== "private") return null;
+  const subject = issue.assigneeAgentId
+    ? { subjectType: "agent" as const, subjectId: issue.assigneeAgentId }
+    : issue.assigneeUserId
+      ? { subjectType: "user" as const, subjectId: issue.assigneeUserId }
+      : null;
+  if (!subject) return null;
+  if (
+    previous
+    && previous.visibility === "private"
+    && previous.assigneeAgentId === issue.assigneeAgentId
+    && previous.assigneeUserId === issue.assigneeUserId
+  ) return null;
+
+  const grantIssueId = issue.id;
+  const lockKey = `issue-access-grant:${grantIssueId}:${subject.subjectType}:${subject.subjectId}`;
+  await dbOrTx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
+  const active = await dbOrTx
+    .select({ id: issueAccessGrants.id })
+    .from(issueAccessGrants)
+    .where(and(
+      eq(issueAccessGrants.issueId, grantIssueId),
+      eq(issueAccessGrants.subjectType, subject.subjectType),
+      eq(issueAccessGrants.subjectId, subject.subjectId),
+      isNull(issueAccessGrants.revokedAt),
+    ))
+    .limit(1)
+    .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+  if (active) return null;
+
+  const grant = await dbOrTx
+    .insert(issueAccessGrants)
+    .values({
+      issueId: grantIssueId,
+      ...subject,
+      source: "assignment",
+      grantedByUserId: actor.userId ?? null,
+      grantedByAgentId: actor.agentId ?? null,
+    })
+    .returning()
+    .then((rows: Array<typeof issueAccessGrants.$inferSelect>) => rows[0]!);
+  await logActivity(dbOrTx as Db, {
+    companyId: issue.companyId,
+    actorType: actor.agentId ? "agent" : actor.userId ? "user" : "system",
+    actorId: actor.agentId ?? actor.userId ?? "issue_service",
+    agentId: actor.agentId ?? null,
+    action: "issue_access_grant.created",
+    entityType: "issue_access_grant",
+    entityId: grant.id,
+    details: {
+      issueId: grant.issueId,
+      subjectType: grant.subjectType,
+      subjectId: grant.subjectId,
+      source: grant.source,
+    },
+  });
+  return grant;
+}
+
 async function terminalExplicitBlockersByRoot(
   companyId: string,
   roots: IssueRelationIssueSummary[],
@@ -3622,132 +3778,6 @@ async function terminalExplicitBlockersByRoot(
   }
 
   return terminalByRoot;
-}
-
-function readProductivityReviewTrigger(
-  value: unknown,
-): IssueProductivityReviewTrigger | null {
-  if (typeof value !== "string") return null;
-  return PRODUCTIVITY_REVIEW_TRIGGERS.includes(
-    value as IssueProductivityReviewTrigger,
-  )
-    ? (value as IssueProductivityReviewTrigger)
-    : null;
-}
-
-function readProductivityReviewStreak(value: unknown): number | null {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
-    return null;
-  return Math.floor(value);
-}
-
-async function listIssueProductivityReviewMap(
-  dbOrTx: any,
-  companyId: string,
-  sourceIssueIds: string[],
-): Promise<Map<string, IssueProductivityReview>> {
-  const map = new Map<string, IssueProductivityReview>();
-  if (sourceIssueIds.length === 0) return map;
-
-  const reviewRows: Array<{
-    sourceIssueId: string | null;
-    reviewIssueId: string;
-    reviewIdentifier: string | null;
-    status: string;
-    priority: string;
-    createdAt: Date;
-    updatedAt: Date;
-  }> = [];
-  for (const chunk of chunkList(
-    [...new Set(sourceIssueIds)],
-    ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE,
-  )) {
-    const rows = await dbOrTx
-      .select({
-        sourceIssueId: issues.originId,
-        reviewIssueId: issues.id,
-        reviewIdentifier: issues.identifier,
-        status: issues.status,
-        priority: issues.priority,
-        createdAt: issues.createdAt,
-        updatedAt: issues.updatedAt,
-      })
-      .from(issues)
-      .where(
-        and(
-          eq(issues.companyId, companyId),
-          eq(issues.originKind, PRODUCTIVITY_REVIEW_ORIGIN_KIND),
-          inArray(issues.originId, chunk),
-          visibleIssueCondition(),
-          notInArray(issues.status, PRODUCTIVITY_REVIEW_TERMINAL_STATUSES),
-        ),
-      )
-      .orderBy(desc(issues.createdAt), desc(issues.id));
-    reviewRows.push(...rows);
-  }
-
-  if (reviewRows.length === 0) return map;
-
-  const reviewIssueIds = reviewRows.map((row) => row.reviewIssueId);
-  const triggerByReviewIssueId = new Map<
-    string,
-    {
-      trigger: IssueProductivityReviewTrigger | null;
-      noCommentStreak: number | null;
-    }
-  >();
-  for (const chunk of chunkList(
-    reviewIssueIds,
-    ISSUE_LIST_RELATED_QUERY_CHUNK_SIZE,
-  )) {
-    const detailRows = await dbOrTx
-      .select({
-        entityId: activityLog.entityId,
-        details: activityLog.details,
-        createdAt: activityLog.createdAt,
-      })
-      .from(activityLog)
-      .where(
-        and(
-          eq(activityLog.companyId, companyId),
-          eq(activityLog.entityType, "issue"),
-          inArray(activityLog.entityId, chunk),
-          inArray(activityLog.action, PRODUCTIVITY_REVIEW_ACTIVITY_ACTIONS),
-        ),
-      )
-      .orderBy(desc(activityLog.createdAt));
-    for (const row of detailRows as Array<{
-      entityId: string;
-      details: Record<string, unknown> | null;
-      createdAt: Date;
-    }>) {
-      if (triggerByReviewIssueId.has(row.entityId)) continue;
-      triggerByReviewIssueId.set(row.entityId, {
-        trigger: readProductivityReviewTrigger(row.details?.trigger),
-        noCommentStreak: readProductivityReviewStreak(
-          row.details?.noCommentStreak,
-        ),
-      });
-    }
-  }
-
-  for (const row of reviewRows) {
-    if (!row.sourceIssueId) continue;
-    if (map.has(row.sourceIssueId)) continue;
-    const detail = triggerByReviewIssueId.get(row.reviewIssueId);
-    map.set(row.sourceIssueId, {
-      reviewIssueId: row.reviewIssueId,
-      reviewIdentifier: row.reviewIdentifier,
-      status: row.status as IssueProductivityReview["status"],
-      priority: row.priority as IssueProductivityReview["priority"],
-      trigger: detail?.trigger ?? null,
-      noCommentStreak: detail?.noCommentStreak ?? null,
-      createdAt: row.createdAt,
-      updatedAt: row.updatedAt,
-    });
-  }
-
-  return map;
 }
 
 async function listIssueBlockerAttentionMap(
@@ -4528,7 +4558,7 @@ async function listIssueReviewAttentionMap(
         .select()
         .from(issues)
         .where(
-          and(eq(issues.companyId, companyId), inArray(issues.id, chunk)),
+          and(eq(issues.companyId, companyId), inArray(issues.id, chunk), nonIdleSlackIssueCondition()),
         )),
     );
   }
@@ -4738,6 +4768,9 @@ async function listIssueReviewAttentionMap(
       assigneeUserId: issue.assigneeUserId,
       createdByAgentId: issue.createdByAgentId,
       createdByUserId: issue.createdByUserId,
+      conversationAgentId: issue.conversationAgentId,
+      conversationUserId: issue.conversationUserId,
+      conversationState: issue.conversationState,
       executionPolicy: issue.executionPolicy,
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
@@ -4892,13 +4925,23 @@ async function listIssueReviewAttentionMap(
 }
 
 const issueListSelect = {
+  externalConversationState: externalConversationStateSql(),
+  conversationAgentId: issues.conversationAgentId,
+  conversationUserId: issues.conversationUserId,
+  conversationState: issues.conversationState,
+  conversationSessionGeneration: issues.conversationSessionGeneration,
+  conversationBoundaryCommentId: issues.conversationBoundaryCommentId,
   id: issues.id,
   companyId: issues.companyId,
   projectId: issues.projectId,
   projectWorkspaceId: issues.projectWorkspaceId,
   goalId: issues.goalId,
   parentId: issues.parentId,
+  visibility: issues.visibility,
+  privacyRootIssueId: issues.privacyRootIssueId,
+  privacyParentIssueId: issues.privacyParentIssueId,
   title: issues.title,
+  titleNeedsGeneration: issues.titleNeedsGeneration,
   description: sql<string | null>`
     CASE
       WHEN ${issues.description} IS NULL THEN NULL
@@ -5834,6 +5877,9 @@ async function listIssueBlockedInboxAttentionMap(
       assigneeUserId: issue.assigneeUserId,
       createdByAgentId: issue.createdByAgentId,
       createdByUserId: issue.createdByUserId,
+      conversationAgentId: issue.conversationAgentId,
+      conversationUserId: issue.conversationUserId,
+      conversationState: issue.conversationState,
       executionPolicy: issue.executionPolicy,
       executionState: issue.executionState,
       monitorNextCheckAt: issue.monitorNextCheckAt,
@@ -6233,6 +6279,7 @@ async function blockedInboxIssueConditions(
     visibleIssueCondition(),
     notInArray(issues.status, [...BLOCKED_INBOX_TERMINAL_STATUSES]),
   ];
+  if (filters?.readCondition) conditions.push(filters.readCondition);
   const touchedByUserId = filters?.touchedByUserId?.trim() || undefined;
   const inboxArchivedByUserId =
     filters?.inboxArchivedByUserId?.trim() || undefined;
@@ -6240,6 +6287,9 @@ async function blockedInboxIssueConditions(
   const contextUserId =
     unreadForUserId ?? touchedByUserId ?? inboxArchivedByUserId;
 
+  if (filters?.createdFromIssueId) {
+    conditions.push(createdFromIssueCondition(companyId, filters.createdFromIssueId));
+  }
   if (filters?.descendantOf) {
     conditions.push(sql<boolean>`
       ${issues.id} IN (
@@ -6362,7 +6412,6 @@ async function listBlockedInboxIssues(
       blockerAttention?: IssueBlockerAttention;
       reviewAttention?: IssueReviewAttention;
       blockedInboxAttention: IssueBlockedInboxAttention;
-      productivityReview?: IssueProductivityReview | null;
       liveDescendantCount?: number;
       lastActivityAt: Date;
       myLastTouchAt?: Date | null;
@@ -6411,7 +6460,6 @@ async function listBlockedInboxIssues(
     blockedByMap,
     blockerAttentionByIssueId,
     reviewAttentionByIssueId,
-    productivityReviewByIssueId,
     blockedInboxAttentionByIssueId,
     liveDescendantCountByIssueId,
   ] = await Promise.all([
@@ -6425,7 +6473,6 @@ async function listBlockedInboxIssues(
     blockedByMapForIssues(dbOrTx, companyId, issueIds),
     listIssueBlockerAttentionMap(dbOrTx, companyId, withRuns),
     listIssueReviewAttentionMap(dbOrTx, companyId, withRuns),
-    listIssueProductivityReviewMap(dbOrTx, companyId, issueIds),
     listIssueBlockedInboxAttentionMap(dbOrTx, companyId, withRuns),
     includeLiveDescendantSummary
       ? liveDescendantCountMapForIssues(dbOrTx, companyId, issueIds)
@@ -6499,9 +6546,6 @@ async function listBlockedInboxIssues(
           reviewAttention:
             reviewAttentionByIssueId.get(row.id) ?? reviewAttentionNone(),
           blockedInboxAttention,
-          ...(productivityReviewByIssueId.has(row.id)
-            ? { productivityReview: productivityReviewByIssueId.get(row.id) }
-            : {}),
           ...(includeLiveDescendantSummary
             ? {
                 liveDescendantCount:
@@ -6592,31 +6636,135 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
+export async function readIssueCommentRunLogText(run: {
+  runId?: string | null;
+  logStore: string | null;
+  logRef: string | null;
+  logBytes: number | null;
+}) {
+  if (run.logStore !== "local_file" || !run.logRef) return "";
+  // A timed-out finalization leaves size unknown even when earlier entries
+  // exist. Read those logs within the same byte budget as a known-size log.
+  if (run.logBytes !== null && (!Number.isFinite(run.logBytes) || run.logBytes <= 0)) return "";
+
+  const logRef = run.logRef;
+  const store = getRunLogStore();
+  let offset = 0;
+  let content = "";
+  let nextOffset: number | undefined = 0;
+  const controller = new AbortController();
+  let readTimer: NodeJS.Timeout | undefined;
+
+  const readChunks = async () => {
+    while (nextOffset !== undefined) {
+      controller.signal.throwIfAborted();
+      const remainingBytes =
+        ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES -
+        Buffer.byteLength(content, "utf8");
+      if (remainingBytes <= 0) break;
+      const chunk = await store.read(
+        { store: "local_file", logRef },
+        {
+          offset,
+          limitBytes: Math.min(ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES, remainingBytes),
+          signal: controller.signal,
+        },
+      );
+      controller.signal.throwIfAborted();
+      content += chunk.content;
+      nextOffset = chunk.nextOffset;
+      offset = chunk.nextOffset ?? 0;
+    }
+  };
+
+  try {
+    await Promise.race([
+      readChunks(),
+      new Promise<never>((_resolve, reject) => {
+        readTimer = setTimeout(() => {
+          const reason = new DOMException("Attribution log read timed out", "TimeoutError");
+          // Cancellation closes storage work where supported, but filesystem
+          // I/O can delay stream destruction. Keep the response deadline too.
+          reject(reason);
+          controller.abort(reason);
+        }, ISSUE_COMMENT_RUN_LOG_DERIVATION_TIMEOUT_MS);
+        readTimer.unref?.();
+      }),
+    ]);
+  } catch (err) {
+    // Attribution enriches already-authorized comments. Missing, failed, or
+    // stalled storage must not prevent listing them; keep any evidence read.
+    // Do not log raw provider errors, which can contain credentialed URLs.
+    logger.warn(
+      { runId: run.runId ?? undefined, logRef, status: err instanceof HttpError ? err.status : undefined },
+      "could not read heartbeat run log while deriving optional issue comment metadata",
+    );
+  } finally {
+    clearTimeout(readTimer);
+  }
+
+  return content;
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
+
+  function provisionalTitleFromDescription(description: string) {
+    const simpleTitle = description.trim().replace(/\s+/g, " ").slice(0, 120);
+    try {
+      type MarkdownNode = {
+        type: string;
+        alt?: string | null;
+        children?: MarkdownNode[];
+        position?: { start: { offset?: number }; end: { offset?: number } };
+      };
+      const imageRanges: Array<{ start: number; end: number }> = [];
+      const imageAlts: string[] = [];
+      const visit = (node: MarkdownNode) => {
+        if (node.type === "image" || node.type === "imageReference") {
+          const start = node.position?.start.offset;
+          const end = node.position?.end.offset;
+          if (start !== undefined && end !== undefined) imageRanges.push({ start, end });
+          if (node.alt?.trim()) imageAlts.push(node.alt.trim());
+        }
+        node.children?.forEach(visit);
+      };
+      visit(parseMarkdown(description) as MarkdownNode);
+      const withoutImages = imageRanges
+        .sort((a, b) => b.start - a.start)
+        .reduce((text, range) => `${text.slice(0, range.start)} ${text.slice(range.end)}`, description);
+      const plainText = markdownToPlainText(withoutImages).trim().replace(/\s+/g, " ");
+      const fallback = imageRanges.length > 0
+        ? imageAlts.join(" ") || "Image"
+        : simpleTitle;
+      return (plainText || fallback).slice(0, 120);
+    } catch {
+      return simpleTitle;
+    }
+  }
 
   function normalizeCreateIssueTitle(title: string) {
     return title.trim().replace(/\s+/g, " ").toLowerCase();
   }
 
   async function getIssueByUuid(id: string) {
-    const row = await db
-      .select()
+    const row = await retryIdempotentDatabaseOperation(() => db
+      .select({ ...getTableColumns(issues), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.id, id))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
     return enriched;
   }
 
   async function getIssueByIdentifier(identifier: string) {
-    const row = await db
-      .select()
+    const row = await retryIdempotentDatabaseOperation(() => db
+      .select({ ...getTableColumns(issues), externalConversationState: externalConversationStateSql() })
       .from(issues)
       .where(eq(issues.identifier, identifier.toUpperCase()))
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
     return enriched;
@@ -6810,54 +6958,6 @@ export function issueService(db: Db) {
     };
   }
 
-  async function readRunLogText(run: {
-    runId?: string | null;
-    logStore: string | null;
-    logRef: string | null;
-    logBytes: number | null;
-  }) {
-    if (run.logStore !== "local_file" || !run.logRef) return "";
-    const logBytes = Number(run.logBytes ?? 0);
-    if (!Number.isFinite(logBytes) || logBytes <= 0) return "";
-
-    const store = getRunLogStore();
-    let offset = 0;
-    let content = "";
-    let nextOffset: number | undefined = 0;
-
-    try {
-      while (nextOffset !== undefined) {
-        const remainingBytes =
-          ISSUE_COMMENT_RUN_LOG_DERIVATION_MAX_LOG_BYTES -
-          Buffer.byteLength(content, "utf8");
-        if (remainingBytes <= 0) break;
-        const chunk = await store.read(
-          { store: "local_file", logRef: run.logRef },
-          {
-            offset,
-            limitBytes: Math.min(
-              ISSUE_COMMENT_RUN_LOG_DERIVATION_CHUNK_BYTES,
-              remainingBytes,
-            ),
-          },
-        );
-        content += chunk.content;
-        nextOffset = chunk.nextOffset;
-        offset = chunk.nextOffset ?? 0;
-      }
-    } catch (err) {
-      if (err instanceof HttpError && err.status === 404) {
-        logger.warn(
-          { err, runId: run.runId ?? undefined, logRef: run.logRef },
-          "missing heartbeat run log while deriving issue comment metadata",
-        );
-        return content;
-      }
-      throw err;
-    }
-
-    return content;
-  }
 
   // Persist a resolved attribution so subsequent reads stop re-scanning run
   // logs (and old "Board" threads stay fixed durably). Best-effort: a write
@@ -7077,7 +7177,7 @@ export function issueService(db: Db) {
           );
           await Promise.all(
             batch.map(async (run) => {
-              logByRunId.set(run.runId, await readRunLogText(run));
+              logByRunId.set(run.runId, await readIssueCommentRunLogText(run));
             }),
           );
         }
@@ -7485,6 +7585,7 @@ export function issueService(db: Db) {
       const lockedIssue = await tx
         .select({
           id: issues.id,
+          companyId: issues.companyId,
           status: issues.status,
           assigneeAgentId: issues.assigneeAgentId,
           checkoutRunId: issues.checkoutRunId,
@@ -7516,7 +7617,7 @@ export function issueService(db: Db) {
       ]);
       const [existingRun, actorRun] = await Promise.all([
         tx
-          .select({ status: heartbeatRuns.status })
+          .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, input.expectedCheckoutRunId))
           .then((rows) => rows[0] ?? null),
@@ -7528,6 +7629,17 @@ export function issueService(db: Db) {
       ]);
       const stale =
         !existingRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(existingRun.status);
+      if (isExplicitContinuationRetryClaim(lockedIssue, existingRun)) {
+        return { adopted: null, latest: lockedIssue };
+      }
+      if (lockedIssue.executionRunId && lockedIssue.executionRunId !== input.expectedCheckoutRunId) {
+        const executionRun = await tx.select().from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, lockedIssue.executionRunId)).for("update")
+          .then(rows => rows[0] ?? null);
+        if (isExplicitContinuationRetryClaim(lockedIssue, executionRun)) {
+          return { adopted: null, latest: lockedIssue };
+        }
+      }
       const actorLive =
         actorRun && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status);
       if (!stale || !actorLive) {
@@ -7637,7 +7749,7 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({ id: issues.id, companyId: issues.companyId, executionRunId: issues.executionRunId })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -7647,11 +7759,12 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select()
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.executionRunId))
         .then((rows) => rows[0] ?? null);
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (isExplicitContinuationRetryClaim(issue, run)) return false;
 
       const updated = await tx
         .update(issues)
@@ -7677,8 +7790,7 @@ export function issueService(db: Db) {
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
   // bundled execution lock cols) when the row's checkoutRunId points at a
   // heartbeat run that is terminal or no longer exists. No assignee/status
-  // precondition: a terminal run holds no real claim regardless of who is
-  // assigned or what status the issue is currently in.
+  // precondition. Explicit retry claims remain owned by queue-first settlement.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -7686,6 +7798,8 @@ export function issueService(db: Db) {
       );
       const issue = await tx
         .select({
+          id: issues.id,
+          companyId: issues.companyId,
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
         })
@@ -7698,11 +7812,12 @@ export function issueService(db: Db) {
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.checkoutRunId} for update`,
       );
       const run = await tx
-        .select({ status: heartbeatRuns.status })
+        .select()
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, issue.checkoutRunId))
         .then((rows) => rows[0] ?? null);
       if (run && !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) return false;
+      if (isExplicitContinuationRetryClaim(issue, run)) return false;
 
       if (
         issue.executionRunId &&
@@ -7712,7 +7827,7 @@ export function issueService(db: Db) {
           sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${issue.executionRunId} for update`,
         );
         const executionRun = await tx
-          .select({ status: heartbeatRuns.status })
+          .select()
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, issue.executionRunId))
           .then((rows) => rows[0] ?? null);
@@ -7721,6 +7836,7 @@ export function issueService(db: Db) {
           !TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status)
         )
           return false;
+        if (isExplicitContinuationRetryClaim(issue, executionRun)) return false;
       }
 
       const updated = await tx
@@ -7836,35 +7952,64 @@ export function issueService(db: Db) {
     },
     dbOrTx: any = db,
   ) {
-    const now = new Date();
-    const [row] = await dbOrTx
-      .insert(issueInboxArchives)
-      .values({
-        companyId,
-        issueId,
-        userId,
-        archivedByActorType: attribution?.archivedByActorType ?? "user",
-        archivedByAgentId: attribution?.archivedByAgentId ?? null,
-        archivedByRunId: attribution?.archivedByRunId ?? null,
-        archivedAt,
-        updatedAt: now,
-      })
-      .onConflictDoUpdate({
-        target: [
-          issueInboxArchives.companyId,
-          issueInboxArchives.issueId,
-          issueInboxArchives.userId,
-        ],
-        set: {
-          archivedAt,
+    const runArchive = async (tx: typeof dbOrTx) => {
+      // Completion locks the issue before archiving. Take the FK's parent lock
+      // first too, or an insert can hold the archive key while waiting on that
+      // issue and deadlock with completion's archive UPSERT. SHARE also holds
+      // companyId stable; different users can still archive concurrently.
+      const [issue] = await tx
+        .select({ id: issues.id })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+        .for("share");
+      if (!issue) throw notFound("Issue not found");
+
+      const now = new Date();
+      const [row] = await tx
+        .insert(issueInboxArchives)
+        .values({
+          companyId,
+          issueId,
+          userId,
           archivedByActorType: attribution?.archivedByActorType ?? "user",
           archivedByAgentId: attribution?.archivedByAgentId ?? null,
           archivedByRunId: attribution?.archivedByRunId ?? null,
+          archivedAt,
           updatedAt: now,
-        },
-      })
-      .returning();
-    return row;
+        })
+        .onConflictDoUpdate({
+          target: [
+            issueInboxArchives.companyId,
+            issueInboxArchives.issueId,
+            issueInboxArchives.userId,
+          ],
+          set: {
+            archivedAt,
+            archivedByActorType: attribution?.archivedByActorType ?? "user",
+            archivedByAgentId: attribution?.archivedByAgentId ?? null,
+            archivedByRunId: attribution?.archivedByRunId ?? null,
+            updatedAt: now,
+          },
+          // A request that waited behind completion must not replace the newer
+          // archive with its earlier request time and resurface the done task.
+          setWhere: lte(issueInboxArchives.archivedAt, archivedAt),
+        })
+        .returning();
+      if (row) return row;
+      // ON CONFLICT holds this row lock even when setWhere skips the update.
+      // Return the newer state, including its matching actor attribution.
+      const [existing] = await tx
+        .select()
+        .from(issueInboxArchives)
+        .where(and(
+          eq(issueInboxArchives.companyId, companyId),
+          eq(issueInboxArchives.issueId, issueId),
+          eq(issueInboxArchives.userId, userId),
+        ));
+      if (!existing) throw new Error("Inbox archive conflict row missing");
+      return existing;
+    };
+    return dbOrTx === db ? db.transaction(runArchive) : runArchive(dbOrTx);
   }
 
   const service = {
@@ -7873,6 +8018,15 @@ export function issueService(db: Db) {
     addStopRelayCommentIfNeeded,
 
     list: async (companyId: string, filters?: IssueFilters) => {
+      if (filters?.sortField === "id" && filters.attention) {
+        throw unprocessable("ID ordering is not supported for blocked attention lists");
+      }
+      if (filters?.afterId !== undefined && (
+        !isUuidLike(filters.afterId) || filters.sortField !== "id" ||
+        filters.sortDir !== "asc" || (filters.offset ?? 0) !== 0
+      )) {
+        throw unprocessable("afterId requires a UUID, ascending ID order and no offset");
+      }
       if (filters?.attention === "blocked") {
         return listBlockedInboxIssues(db, companyId, {
           ...filters,
@@ -7885,6 +8039,14 @@ export function issueService(db: Db) {
         eq(issues.companyId, companyId),
         visibleIssueCondition(),
       ];
+      if (!filters?.q?.trim()) {
+        conditions.push(isNull(issues.conversationAgentId));
+        if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
+          conditions.push(nonIdleSlackIssueCondition());
+        }
+      }
+      if (filters?.afterId) conditions.push(gt(issues.id, filters.afterId));
+      if (filters?.readCondition) conditions.push(filters.readCondition);
       const assigneeAgentFilter = parseIssueAssigneeAgentFilter(
         filters?.assigneeAgentId,
       );
@@ -7910,24 +8072,10 @@ export function issueService(db: Db) {
         filters?.includeLiveDescendantSummary === true;
       const rawSearch = filters?.q?.trim() ?? "";
       const hasSearch = rawSearch.length > 0;
-      const escapedSearch = hasSearch ? escapeLikePattern(rawSearch) : "";
-      const startsWithPattern = `${escapedSearch}%`;
-      const containsPattern = `%${escapedSearch}%`;
-      const titleStartsWithMatch = sql<boolean>`${issues.title} ILIKE ${startsWithPattern} ESCAPE '\\'`;
-      const titleContainsMatch = sql<boolean>`${issues.title} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const identifierStartsWithMatch = sql<boolean>`${issues.identifier} ILIKE ${startsWithPattern} ESCAPE '\\'`;
-      const identifierContainsMatch = sql<boolean>`${issues.identifier} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const descriptionContainsMatch = sql<boolean>`${issues.description} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const commentContainsMatch = sql<boolean>`
-        EXISTS (
-          SELECT 1
-          FROM ${issueComments}
-          WHERE ${issueComments.issueId} = ${issues.id}
-            AND ${issueComments.companyId} = ${companyId}
-            AND ${issueComments.deletedAt} IS NULL
-            AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
-        )
-      `;
+      const taskSearch = parseTaskSearch(rawSearch);
+      if (filters?.createdFromIssueId) {
+        conditions.push(createdFromIssueCondition(companyId, filters.createdFromIssueId));
+      }
       if (filters?.descendantOf) {
         conditions.push(sql<boolean>`
           ${issues.id} IN (
@@ -8032,16 +8180,6 @@ export function issueService(db: Db) {
           ),
         );
       }
-      if (hasSearch) {
-        conditions.push(
-          or(
-            titleContainsMatch,
-            identifierContainsMatch,
-            descriptionContainsMatch,
-            commentContainsMatch,
-          )!,
-        );
-      }
       if (filters?.updatedSince) {
         const since = new Date(filters.updatedSince);
         if (Number.isFinite(since.getTime())) {
@@ -8056,20 +8194,15 @@ export function issueService(db: Db) {
         conditions.push(ne(issues.originKind, "routine_execution"));
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
-      const searchOrder = sql<number>`
-        CASE
-          WHEN ${titleStartsWithMatch} THEN 0
-          WHEN ${titleContainsMatch} THEN 1
-          WHEN ${identifierStartsWithMatch} THEN 2
-          WHEN ${identifierContainsMatch} THEN 3
-          WHEN ${commentContainsMatch} THEN 4
-          WHEN ${descriptionContainsMatch} THEN 5
-          ELSE 6
-        END
-      `;
-      const baseQuery = db
-        .select(issueListSelect)
-        .from(issues)
+      const searchOrder = sql<number>`-task_search.score`;
+      const issueSource = db.select(issueListSelect).from(issues);
+      const searchedSource = hasSearch
+        ? issueSource.innerJoin(sql`(
+            ${taskSearchCtes(companyId, taskSearch, true, and(...conditions), filters?.readCondition)}
+            SELECT m.id, ${taskSearchScore(taskSearch)} AS score FROM matched m
+          ) task_search`, sql`task_search.id = ${issues.id}`)
+        : issueSource;
+      const baseQuery = searchedSource
         .where(and(...conditions))
         .orderBy(
           ...issueListOrderBy(companyId, {
@@ -8140,12 +8273,10 @@ export function issueService(db: Db) {
       const [
         blockerAttentionByIssueId,
         reviewAttentionByIssueId,
-        productivityReviewByIssueId,
         blockedInboxAttentionByIssueId,
       ] = await Promise.all([
         listIssueBlockerAttentionMap(db, companyId, withRuns),
         listIssueReviewAttentionMap(db, companyId, withRuns),
-        listIssueProductivityReviewMap(db, companyId, issueIds),
         includeBlockedInboxAttention
           ? listIssueBlockedInboxAttentionMap(db, companyId, withRuns)
           : Promise.resolve(new Map<string, IssueBlockedInboxAttention>()),
@@ -8182,9 +8313,6 @@ export function issueService(db: Db) {
                   liveDescendantCount:
                     liveDescendantCountByIssueId.get(row.id) ?? 0,
                 }
-              : {}),
-            ...(productivityReviewByIssueId.has(row.id)
-              ? { productivityReview: productivityReviewByIssueId.get(row.id) }
               : {}),
           };
         });
@@ -8229,9 +8357,6 @@ export function issueService(db: Db) {
                   liveDescendantCountByIssueId.get(row.id) ?? 0,
               }
             : {}),
-          ...(productivityReviewByIssueId.has(row.id)
-            ? { productivityReview: productivityReviewByIssueId.get(row.id) }
-            : {}),
           ...deriveIssueUserContext(row, contextUserId, {
             myLastCommentAt:
               statsByIssueId.get(row.id)?.myLastCommentAt ?? null,
@@ -8248,10 +8373,14 @@ export function issueService(db: Db) {
         return countBlockedInboxIssues(db, companyId, filters);
       }
 
-      const conditions = [
-        eq(issues.companyId, companyId),
-        visibleIssueCondition(),
-      ];
+      const conditions = [eq(issues.companyId, companyId), visibleIssueCondition()];
+      if (filters?.readCondition) conditions.push(filters.readCondition);
+      if (!filters?.q?.trim()) {
+        conditions.push(isNull(issues.conversationAgentId));
+        if (!filters?.touchedByUserId && !filters?.unreadForUserId && !filters?.inboxArchivedByUserId) {
+          conditions.push(nonIdleSlackIssueCondition());
+        }
+      }
       const statuses = parseStatusFilter(filters?.status);
       if (statuses.length === 1)
         conditions.push(eq(issues.status, statuses[0]!));
@@ -9099,14 +9228,6 @@ export function issueService(db: Db) {
       return listIssueReviewAttentionMap(dbOrTx, companyId, issueRows);
     },
 
-    listProductivityReviews: async (
-      companyId: string,
-      sourceIssueIds: string[],
-      dbOrTx: any = db,
-    ) => {
-      return listIssueProductivityReviewMap(dbOrTx, companyId, sourceIssueIds);
-    },
-
     listWakeableBlockedDependents: async (blockerIssueId: string) => {
       const blockerIssue = await db
         .select({ id: issues.id, companyId: issues.companyId })
@@ -9129,6 +9250,7 @@ export function issueService(db: Db) {
             eq(issueRelations.companyId, blockerIssue.companyId),
             eq(issueRelations.type, "blocks"),
             eq(issueRelations.issueId, blockerIssueId),
+            isNull(issues.conversationAgentId),
           ),
         );
       if (candidates.length === 0) return [];
@@ -9177,6 +9299,8 @@ export function issueService(db: Db) {
       const parent = await db
         .select({
           id: issues.id,
+          conversationAgentId: issues.conversationAgentId,
+          originKind: issues.originKind,
           assigneeAgentId: issues.assigneeAgentId,
           status: issues.status,
           companyId: issues.companyId,
@@ -9184,11 +9308,8 @@ export function issueService(db: Db) {
         .from(issues)
         .where(eq(issues.id, parentIssueId))
         .then((rows) => rows[0] ?? null);
-      if (
-        !parent ||
-        !parent.assigneeAgentId ||
-        ["backlog", "done", "cancelled"].includes(parent.status)
-      ) {
+      if (!parent || parent.conversationAgentId || !parent.assigneeAgentId || ["backlog", "cancelled"].includes(parent.status) ||
+          (parent.status === "done" && parent.originKind !== "onboarding_first_task")) {
         return null;
       }
 
@@ -9260,6 +9381,7 @@ export function issueService(db: Db) {
         }));
 
       return {
+        onboardingCompletion: parent.originKind === "onboarding_first_task",
         id: parent.id,
         assigneeAgentId: parent.assigneeAgentId,
         childIssueIds: children.map((child) => child.id),
@@ -9276,6 +9398,7 @@ export function issueService(db: Db) {
         .where(eq(issues.id, parentIssueId))
         .then((rows) => rows[0] ?? null);
       if (!parent) throw notFound("Parent issue not found");
+      await assertExecutionTaskParent(db, parent.companyId, parent.id);
 
       const idempotencyKey = data.idempotencyKey?.trim();
       if (idempotencyKey) {
@@ -9297,6 +9420,7 @@ export function issueService(db: Db) {
               "Child creation idempotency key belongs to another parent issue",
             );
           }
+          await data.assertCanReuseIssue?.(existingChild);
           data.onDeduplicated?.("idempotency_key");
           const [enriched] = await withIssueLabels(db, [existingChild]);
           const [withRelations] = await withIssueRelationSummaries(
@@ -9774,12 +9898,21 @@ export function issueService(db: Db) {
       });
     },
 
+    listConversations: async (companyId: string, userId: string) => db.select().from(issues).where(and(
+      eq(issues.companyId, companyId), eq(issues.conversationUserId, userId), isNotNull(issues.conversationAgentId),
+    )).orderBy(desc(issues.updatedAt), asc(issues.id)),
+
+    getConversation: async (companyId: string, agentId: string, userId: string) => db.select().from(issues).where(and(
+      eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId), eq(issues.conversationUserId, userId),
+    )).then((rows) => rows[0] ?? null),
+
     create: async (
       companyId: string,
       data: IssueCreateInput,
       dbOrTx: Db | DbTransaction = db,
     ) => {
       const {
+        initialPlan,
         labelIds: inputLabelIds,
         blockedByIssueIds,
         inheritExecutionWorkspaceFromIssueId,
@@ -9791,9 +9924,20 @@ export function issueService(db: Db) {
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
+        assertCanReuseIssue,
         onDeduplicated,
         ...issueData
       } = data;
+      const explicitTitle = issueData.title?.trim();
+      const provisionalTitle = issueData.description
+        ? provisionalTitleFromDescription(issueData.description)
+        : undefined;
+      const resolvedTitle = explicitTitle || provisionalTitle;
+      if (!resolvedTitle) throw unprocessable("Provide a title or task description");
+      const titleNeedsGeneration = !explicitTitle;
+      // A prompt prefix is not a task identity: distinct requests can share it.
+      const deduplicateByTitle = allowDuplicate === false && !titleNeedsGeneration;
+      issueData.title = resolvedTitle;
       const isolatedWorkspacesEnabled = (
         await instanceSettings.getExperimental()
       ).enableIsolatedWorkspaces;
@@ -9821,9 +9965,22 @@ export function issueService(db: Db) {
         throw unprocessable("in_progress issues require an assignee");
       }
       const persist = async (tx: DbTransaction) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${companyId}`}, 0))`);
+        await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
+        if (issueData.conversationAgentId && issueData.conversationUserId) {
+          const identity = `conversation:${companyId}:${issueData.conversationAgentId}:${issueData.conversationUserId}`;
+          await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${identity}, 0))`);
+          const [existing] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId),
+            eq(issues.conversationAgentId, issueData.conversationAgentId), eq(issues.conversationUserId, issueData.conversationUserId)));
+          if (existing) {
+            const [enriched] = await withIssueLabels(tx, [existing]);
+            const [withRelations] = await withIssueRelationSummaries(companyId, [enriched], tx);
+            return withRelations;
+          }
+        }
         const idempotencyKey = rawIdempotencyKey?.trim() || null;
-        const normalizedTitle = normalizeCreateIssueTitle(issueData.title);
-        if (allowDuplicate === false) {
+        const normalizedTitle = normalizeCreateIssueTitle(resolvedTitle);
+        if (deduplicateByTitle) {
           const titleGuardKey = `issue-create:title:${companyId}:${issueData.parentId ?? "root"}:${normalizedTitle}`;
           await tx.execute(
             sql`select pg_advisory_xact_lock(hashtextextended(${titleGuardKey}, 0))`,
@@ -9872,7 +10029,7 @@ export function issueService(db: Db) {
             .then((rows) => rows.map((row) => row.issues));
           if (existingIssue) deduplicationReason = "idempotency_key";
         }
-        if (!existingIssue && allowDuplicate === false) {
+        if (!existingIssue && deduplicateByTitle) {
           [existingIssue] = await tx
             .select()
             .from(issues)
@@ -9896,6 +10053,8 @@ export function issueService(db: Db) {
           if (existingIssue) deduplicationReason = "recent_open_title";
         }
         if (existingIssue) {
+          // A duplicate may have a different scope or assignee than the proposed task.
+          await assertCanReuseIssue?.(existingIssue);
           if (idempotencyKey) {
             await tx
               .insert(issueCreateIdempotencyKeys)
@@ -10152,8 +10311,66 @@ export function issueService(db: Db) {
           },
         );
 
+        let visibility = issueData.visibility ?? "open";
+        let privacyRootIssueId: string | null = null;
+        // Provenance survives standalone chat handoffs. This is an access edge,
+        // independent of the product's structural parent/child relationship.
+        let privacyParentIssueId = issueData.parentId ?? null;
+        const sourceRunId = issueData.originRunId ?? actorRunId;
+        if (!privacyParentIssueId && sourceRunId) {
+          const [sourceRun] = await tx.select().from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.id, sourceRunId), eq(heartbeatRuns.companyId, companyId)));
+          const sourceId = sourceRun?.nativeIssueId ?? sourceRun?.issueId ?? sourceRun?.contextSnapshot?.issueId;
+          if (typeof sourceId === "string") privacyParentIssueId = sourceId;
+        }
+        let inheritedPrivateSubtree = false;
+        if (privacyParentIssueId) {
+          const [source] = await tx.select().from(issues)
+            .where(and(eq(issues.id, privacyParentIssueId), eq(issues.companyId, companyId)));
+          if (!source) privacyParentIssueId = null;
+          else if (source.visibility === "private" || (source.projectId && await tx.select({ id: projects.id }).from(projects)
+            .where(and(eq(projects.id, source.projectId), eq(projects.visibility, "private"))).limit(1).then(rows => rows.length > 0))) {
+            visibility = "private";
+            privacyRootIssueId = source.privacyRootIssueId ?? source.id;
+            inheritedPrivateSubtree = true;
+          }
+        }
+        if (visibility === "private" && !privacyRootIssueId) {
+          issueData.id ??= randomUUID();
+          privacyRootIssueId = issueData.id;
+        }
+
+        if (issueData.projectId) {
+          const selectedProject = await tx
+            .select({ visibility: projects.visibility })
+            .from(projects)
+            .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, companyId)))
+            .then((rows) => rows[0] ?? null);
+          if (!selectedProject) throw notFound("Project not found");
+          if (selectedProject.visibility === "private") {
+            visibility = "private";
+            if (!privacyRootIssueId) {
+              issueData.id ??= randomUUID();
+              privacyRootIssueId = issueData.id;
+            }
+          }
+        }
+
+        if (visibility === "private" && !issueData.projectId && !inheritedPrivateSubtree) {
+          if (!responsibleUserId) {
+            throw unprocessable("Private tasks require a responsible user");
+          }
+          const personalProject = await ensurePersonalPrivateProject(tx, companyId, responsibleUserId);
+          issueData.projectId = personalProject.id;
+        }
+
         const values = {
           ...issueData,
+          visibility,
+          privacyRootIssueId,
+          privacyParentIssueId,
+          titleNeedsGeneration,
+          originRunId: issueData.originRunId ?? actorRunId ?? null,
           responsibleUserId,
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
           originKind: issueData.originKind ?? "manual",
@@ -10195,6 +10412,21 @@ export function issueService(db: Db) {
         );
 
         const [issue] = await tx.insert(issues).values(values).returning();
+        await attachOwnedDraftImages(tx, issue, issue.description, { userId: issueData.createdByUserId, agentId: issueData.createdByAgentId });
+        if (issue.visibility === "private" && !inheritedPrivateSubtree && issueData.createdByAgentId) {
+          await tx.insert(issueAccessGrants).values({
+            issueId: issue.id,
+            subjectType: "agent",
+            subjectId: issueData.createdByAgentId,
+            source: "explicit",
+            grantedByAgentId: issueData.createdByAgentId,
+          }).onConflictDoNothing();
+        }
+        await ensureAssignmentIssueAccessGrant(tx, issue, null, {
+          agentId: issueData.createdByAgentId ?? null,
+          userId: issueData.createdByUserId ?? null,
+        });
+        await recordChatHandoff(tx, issue, actorRunId);
         if (idempotencyKey) {
           await tx.insert(issueCreateIdempotencyKeys).values({
             companyId,
@@ -10227,6 +10459,14 @@ export function issueService(db: Db) {
             },
             tx,
           );
+        }
+        if (initialPlan?.trim()) {
+          await documentService(tx as unknown as Db).upsertIssueDocument({
+            issueId: issue.id, key: "plan", title: "Plan", format: "markdown", body: initialPlan,
+            createdByAgentId: issueData.createdByAgentId, createdByUserId: issueData.createdByUserId,
+            createdByRunId: actorRunId,
+            sourceTrust: issue.sourceTrust,
+          });
         }
         const [enriched] = await withIssueLabels(tx, [issue]);
         const [withRelations] = await withIssueRelationSummaries(
@@ -10369,6 +10609,7 @@ export function issueService(db: Db) {
 
         let counter = base;
         for (const row of rows) {
+          await assertExecutionTaskParent(tx as unknown as Db, companyId, row.parentId);
           counter += 1;
           const issueNumber = counter;
           const identifier = `${company.issuePrefix}-${issueNumber}`;
@@ -10453,8 +10694,8 @@ export function issueService(db: Db) {
             createdAt: row.createdAt ?? new Date(),
             updatedAt: row.updatedAt ?? new Date(),
             // Imported in-progress work did not start at import time; fabricating
-            // startedAt here trips duration-based sweeps (e.g. productivity
-            // review). Only a bundle-carried startedAt is written.
+            // startedAt here would misrepresent its active episode.
+            // Only a bundle-carried startedAt is written.
             startedAt: row.startedAt ?? null,
             completedAt:
               row.completedAt ?? (row.status === "done" ? new Date() : null),
@@ -10588,12 +10829,15 @@ export function issueService(db: Db) {
         labelIds?: string[];
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
+        actorRunId?: string | null;
+        actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
       postCommitActions?: IssuePostCommitAction[],
+      options: { bindRuntimeSharedWorkspace?: boolean } = {},
     ) => {
       const ownedActivityPublications: ActivityPublication[] = [];
       const activityPublications =
@@ -10616,15 +10860,30 @@ export function issueService(db: Db) {
         .where(idPredicate)
         .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
       if (!existing) return null;
+      if (data.parentId !== undefined && data.parentId !== existing.parentId) {
+        await assertExecutionTaskParent(dbOrTx, existing.companyId, data.parentId);
+      }
+      if (existing.conversationAgentId) {
+        if ((data.assigneeAgentId !== undefined && data.assigneeAgentId !== existing.conversationAgentId)
+          || data.assigneeUserId || data.conversationAgentId !== undefined || data.conversationUserId !== undefined
+          || data.conversationState !== undefined || data.conversationSessionGeneration !== undefined
+          || data.conversationBoundaryCommentId !== undefined || data.status === "done" || data.status === "cancelled") {
+          throw unprocessable("Conversation identity is fixed; finish the reply instead of completing or reassigning the conversation");
+        }
+      }
 
       const {
         labelIds: nextLabelIds,
         blockedByIssueIds,
         actorAgentId,
+        actorRunId,
+        actorRunStopId,
         actorUserId,
         companyGuard,
         ...issueData
       } = data;
+      // An explicit edit claims the title, even if it keeps the same text.
+      if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
       if (
         issueData.assigneeAgentId !== undefined &&
         issueData.assigneeAgentId !== existing.assigneeAgentId
@@ -10653,7 +10912,30 @@ export function issueService(db: Db) {
       const isolatedWorkspacesEnabled = (
         await instanceSettings.getExperimental()
       ).enableIsolatedWorkspaces;
-      if (!isolatedWorkspacesEnabled) {
+      if (options.bindRuntimeSharedWorkspace) {
+        const workspaceId = issueData.executionWorkspaceId ?? existing.executionWorkspaceId;
+        if (!workspaceId) {
+          throw unprocessable("Runtime workspace binding requires an existing shared workspace");
+        }
+        const [workspace] = await dbOrTx
+          .select({ mode: executionWorkspaces.mode })
+          .from(executionWorkspaces)
+          .where(and(
+            eq(executionWorkspaces.id, workspaceId),
+            eq(executionWorkspaces.companyId, existing.companyId),
+          ));
+        if (
+          workspace?.mode !== "shared_workspace" ||
+          (issueData.executionWorkspacePreference ?? existing.executionWorkspacePreference) !== "reuse_existing" ||
+          (issueData.executionWorkspaceSettings ?? existing.executionWorkspaceSettings)?.mode !== "shared_workspace"
+        ) {
+          throw unprocessable("Runtime workspace binding requires an existing shared workspace");
+        }
+      }
+      // Warm sandbox continuity is runtime bookkeeping, independent of the
+      // opt-in UI for creating isolated worktrees. Public updates still obey
+      // the feature gate; only the internal shared-workspace binding bypasses it.
+      if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace) {
         delete issueData.executionWorkspaceId;
         delete issueData.executionWorkspacePreference;
         delete issueData.executionWorkspaceSettings;
@@ -10667,6 +10949,23 @@ export function issueService(db: Db) {
         ...issueData,
         updatedAt: new Date(),
       };
+      if (issueData.visibility === "private") {
+        patch.privacyRootIssueId = existing.privacyRootIssueId ?? existing.id;
+      } else if (issueData.visibility === "open") {
+        patch.privacyRootIssueId = null;
+      }
+      if (issueData.projectId) {
+        const selectedProject = await dbOrTx
+          .select({ visibility: projects.visibility })
+          .from(projects)
+          .where(and(eq(projects.id, issueData.projectId), eq(projects.companyId, existing.companyId)))
+          .then((rows: Array<{ visibility: string }>) => rows[0] ?? null);
+        if (!selectedProject) throw notFound("Project not found");
+        if (selectedProject.visibility === "private") {
+          patch.visibility = "private";
+          patch.privacyRootIssueId = existing.privacyRootIssueId ?? existing.id;
+        }
+      }
       if (existing.status !== "blocked" && issueData.status === "blocked") {
         patch.blockedTransitionAt = patch.updatedAt;
         patch.blockedOwnerNotifiedAt = null;
@@ -10861,6 +11160,8 @@ export function issueService(db: Db) {
       }
 
       const runUpdate = async (tx: any) => {
+        const changesPrivacy = issueData.visibility !== undefined || issueData.parentId !== undefined || issueData.projectId !== undefined;
+        if (changesPrivacy) await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${existing.companyId}`}, 0))`);
         // The receipt baseline must be read under the same row lock as the
         // write. Otherwise a concurrent update can be mistaken for a change
         // made by this request.
@@ -10871,6 +11172,39 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (changesPrivacy) {
+          const nextProjectId = issueData.projectId !== undefined ? issueData.projectId : receiptExisting.projectId;
+          const [privacyProject] = nextProjectId ? await tx.select().from(projects)
+            .where(and(eq(projects.id, nextProjectId), eq(projects.companyId, existing.companyId))) : [];
+          if (privacyProject?.visibility === "private") {
+            if (issueData.visibility === "open") {
+              if (!privacyProject.personalOwnerUserId) throw unprocessable("Move this task out of its private project before making it public");
+              patch.projectId = null;
+            } else {
+              patch.visibility = "private";
+              patch.privacyRootIssueId = receiptExisting.privacyRootIssueId ?? receiptExisting.id;
+            }
+          }
+          const privacyParentId = issueData.parentId !== undefined ? issueData.parentId : receiptExisting.privacyParentIssueId;
+          const [privacyParent] = privacyParentId ? await tx.select().from(issues)
+            .where(and(eq(issues.id, privacyParentId), eq(issues.companyId, existing.companyId))) : [];
+          patch.privacyParentIssueId = privacyParent?.id ?? null;
+          if (privacyParent && (privacyParent.visibility === "private" || (privacyParent.projectId && await tx.select({ id: projects.id }).from(projects)
+            .where(and(eq(projects.id, privacyParent.projectId), eq(projects.visibility, "private"))).limit(1).then((rows: Array<{ id: string }>) => rows.length > 0)))) {
+            if (issueData.visibility === "open") throw unprocessable("A task cannot be made public while it inherits private access");
+            patch.visibility = "private";
+            patch.privacyRootIssueId = privacyParent.privacyRootIssueId ?? privacyParent.id;
+          } else if (issueData.visibility === "private") {
+            patch.privacyRootIssueId = receiptExisting.id;
+          }
+        }
+        if (actorAgentId && actorRunId) {
+          // Recheck under a run lock: a request admitted before Stop must not
+          // commit a late Done after cancellation revoked its credentials.
+          await assertAgentRunWriteAllowed(tx, receiptExisting.companyId, {
+            agentId: actorAgentId, runId: actorRunId, stopId: actorRunStopId,
+          });
+        }
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
@@ -10905,6 +11239,30 @@ export function issueService(db: Db) {
           projectGoalId: nextProjectGoalId,
           defaultGoalId: defaultCompanyGoal?.id ?? null,
         });
+        // Ownership changes invalidate observed handoff versions even if status
+        // stays the same, including an A -> B -> A assignment race.
+        if ((issueData.assigneeAgentId !== undefined && issueData.assigneeAgentId !== receiptExisting.assigneeAgentId)
+          || (issueData.assigneeUserId !== undefined && issueData.assigneeUserId !== receiptExisting.assigneeUserId)) {
+          patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+          // Invalidate human direction at the common assignment boundary, including
+          // plugin/service writes that do not go through HTTP run cancellation.
+          // Keep the requester attribution for audit; cancellation revokes its use.
+          await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date(), updatedAt: new Date() })
+            .where(and(eq(agentWakeupRequests.companyId, receiptExisting.companyId),
+              eq(agentWakeupRequests.requestedByActorType, "user"),
+              sql`coalesce(${agentWakeupRequests.payload}->>'issueId', ${agentWakeupRequests.payload}->>'taskId',
+                ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId',
+                ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId') = ${id}`));
+        }
+        // Reasserting Blocked or changing its blockers is a fresh decision even
+        // when the status string stays the same. Invalidate recovery's prior
+        // status receipt without treating comment recency as blocking intent.
+        if (receiptExisting.status === "blocked" &&
+            (issueData.status === "blocked" ||
+              (issueData.status === undefined &&
+                (blockedByIssueIds !== undefined || issueData.unblockDescriptor !== undefined)))) {
+          patch.statusVersion = sql`${issues.statusVersion} + 1` as unknown as number;
+        }
         const updated = await tx
           .update(issues)
           .set(patch)
@@ -10912,6 +11270,42 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
+          { userId: actorUserId, agentId: actorAgentId });
+        if (changesPrivacy && updated.visibility === "private") {
+          // Creation and tree changes hold the same company lock. No child can
+          // slip into the tree between discovering descendants and protecting them.
+          const protectedRows = await tx.execute(sql`with recursive descendants as (
+            select i.id, i.parent_id, i.privacy_parent_issue_id from issues i
+              where i.id = ${updated.id} and i.company_id = ${updated.companyId}
+            union
+            select i.id, i.parent_id, i.privacy_parent_issue_id from issues i join descendants p
+              on i.parent_id = p.id or i.privacy_parent_issue_id = p.id
+              where i.company_id = ${updated.companyId}
+          ) update issues i set visibility = 'private',
+              privacy_root_issue_id = ${updated.privacyRootIssueId ?? updated.id},
+              privacy_parent_issue_id = coalesce(i.privacy_parent_issue_id, i.parent_id), updated_at = now()
+            from descendants d where i.id = d.id and i.id <> ${updated.id} returning i.id`);
+          if (protectedRows.length) {
+            const descendants = await tx.select().from(issues).where(inArray(issues.id, protectedRows.map((row: { id: string }) => row.id)));
+            for (const descendant of descendants) await ensureAssignmentIssueAccessGrant(tx, descendant, null, {
+              agentId: actorAgentId ?? null, userId: actorUserId ?? null,
+            });
+          }
+        }
+        await ensureAssignmentIssueAccessGrant(tx, updated, receiptExisting, {
+          agentId: actorAgentId ?? null,
+          userId: actorUserId ?? null,
+        });
+        await recordChatCompletion(tx, receiptExisting, updated);
+        // An operator explicitly choosing a disposition owns that decision,
+        // including choosing In Review while the conversation is Idle.
+        if (actorUserId && issueData.status !== undefined) {
+          await tx.update(chatConversations).set({ state: "active", updatedAt: new Date() })
+            .where(and(eq(chatConversations.companyId, updated.companyId), eq(chatConversations.issueId, updated.id),
+              eq(chatConversations.state, "waiting"), sql`exists (select 1 from chat_endpoints e
+                where e.id = ${chatConversations.endpointId} and e.company_id = ${chatConversations.companyId} and e.provider = 'slack')`));
+        }
         if (updated.assigneeAgentId !== existing.assigneeAgentId || updated.assigneeUserId !== existing.assigneeUserId) {
           const { issueThreadInteractionService } = await import("./issue-thread-interactions.js");
           await issueThreadInteractionService(tx).expireConnectionIntentsForOwnershipChange(updated);
@@ -10959,11 +11353,24 @@ export function issueService(db: Db) {
             await finalizeSummarySlotsForTerminalIssue(tx, updated);
             // Every terminal transition funnels through here, including direct
             // service callers (tree control, recovery, pipelines, status cards)
-            // that never touch the HTTP routes, so pending interaction cards
-            // cannot outlive their issue. Dynamic import breaks the module
+            // that never touch the HTTP routes. Governed cards expire; ordinary
+            // historical questions remain answerable after completion.
+            // Dynamic import breaks the module
             // cycle (issue-thread-interactions.js imports issueService).
             const { issueThreadInteractionService } =
               await import("./issue-thread-interactions.js");
+            // Stop live question requests independently of card expiry. A
+            // historical question retained in the feed must not keep its
+            // source run waiting after the task closes.
+            const pendingQuestions = await tx
+              .select()
+              .from(issueThreadInteractions)
+              .where(and(
+                eq(issueThreadInteractions.companyId, updated.companyId),
+                eq(issueThreadInteractions.issueId, updated.id),
+                eq(issueThreadInteractions.kind, "ask_user_questions"),
+                eq(issueThreadInteractions.status, "pending"),
+              ));
             const expiredInteractions = await issueThreadInteractionService(
               tx,
             ).expirePendingInteractionsForTerminalIssue(updated, {
@@ -10974,31 +11381,31 @@ export function issueService(db: Db) {
               nativeQuestionCancellationIdentity,
               requestNativeQuestionRunCancellation,
             } = await import("./native-runtime/native-question-bridge.js");
-            for (const interaction of expiredInteractions) {
-              if (interaction.kind === "ask_user_questions") {
-                const nativeQuestion =
-                  nativeQuestionCancellationIdentity(interaction);
-                if (nativeQuestion) {
-                  if (dbOrTx !== db && !postCommitActions) {
-                    throw new Error(
-                      "Terminal native question updates in an external transaction require a post-commit action queue",
-                    );
-                  }
-                  const runId = await requestNativeQuestionRunCancellation(
-                    tx,
-                    nativeQuestion,
-                    { kind: "issue_terminal", issueStatus: updated.status },
+            for (const interaction of pendingQuestions) {
+              const nativeQuestion =
+                nativeQuestionCancellationIdentity(interaction);
+              if (nativeQuestion) {
+                if (dbOrTx !== db && !postCommitActions) {
+                  throw new Error(
+                    "Terminal native question updates in an external transaction require a post-commit action queue",
                   );
-                  if (runId) {
-                    queuedPostCommitActions.push({
-                      type: "cancel_native_question_run",
-                      runId,
-                      issueId: updated.id,
-                      issueStatus: updated.status,
-                    });
-                  }
+                }
+                const runId = await requestNativeQuestionRunCancellation(
+                  tx,
+                  nativeQuestion,
+                  { kind: "issue_terminal", issueStatus: updated.status },
+                );
+                if (runId) {
+                  queuedPostCommitActions.push({
+                    type: "cancel_native_question_run",
+                    runId,
+                    issueId: updated.id,
+                    issueStatus: updated.status,
+                  });
                 }
               }
+            }
+            for (const interaction of expiredInteractions) {
               await logActivity(tx as unknown as Db, {
                 companyId: updated.companyId,
                 actorType: actorAgentId
@@ -11484,10 +11891,10 @@ export function issueService(db: Db) {
         current.executionRunId !== checkoutRunId &&
         (current.assigneeAgentId === agentId || current.assigneeAgentId == null)
       ) {
-        const stale = await isTerminalOrMissingHeartbeatRun(
-          current.executionRunId,
-        );
-        if (stale) {
+        const executionRun = await db.select().from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, current.executionRunId)).then(rows => rows[0] ?? null);
+        const stale = !executionRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(executionRun.status);
+        if (stale && !isExplicitContinuationRetryClaim({ ...current, companyId: issueCompany.companyId }, executionRun)) {
           const now = new Date();
           const adoptionSet: Record<string, unknown> = {
             assigneeAgentId: agentId,
@@ -11746,14 +12153,16 @@ export function issueService(db: Db) {
           }
         }
 
-        // Release clears checkout/assignee locks; only in_progress work re-queues to todo.
+        // Terminal assignment records who owned the work, not a live execution
+        // claim. Cleanup must preserve it; unfinished release still relinquishes it.
+        const isTerminal = existing.status === "done" || existing.status === "cancelled";
         const releaseStatus =
           existing.status === "in_progress" ? "todo" : existing.status;
         const updated = await tx
           .update(issues)
           .set({
             status: releaseStatus,
-            assigneeAgentId: null,
+            assigneeAgentId: isTerminal ? existing.assigneeAgentId : null,
             checkoutRunId: null,
             executionRunId: null,
             executionAgentNameKey: null,
@@ -12071,12 +12480,17 @@ export function issueService(db: Db) {
         metadata?: IssueCommentMetadata | null;
         attachmentIds?: string[];
         authorizationReason?: string | null;
+        /** Server-only final assistant response, never a tool/progress comment. */
+        completionReply?: boolean;
         sourceTrust?: typeof issueComments.$inferInsert.sourceTrust;
         createdAt?: Date | string | null;
+        clientRequestId?: string;
+        /** Server-only: authenticated Paperclip messages also belong in the Slack thread. */
+        mirrorToSlack?: boolean;
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
-      if (dbOrTx === db && actor.runId) {
+      if (dbOrTx === db && (actor.runId || actor.userId)) {
         const append = () =>
           db.transaction(async (tx) => {
             // Serialize run-authored comments on the issue so a provider retry
@@ -12095,14 +12509,22 @@ export function issueService(db: Db) {
           ? retryNativeChatReviewPresentation(append)
           : append();
       }
-      const issue = await dbOrTx
-        .select({ companyId: issues.companyId })
+      // The query below locks human comments on caller-owned transactions too,
+      // sharing the fence with both question creation and Slack settlement.
+      const issueQuery = dbOrTx
+        .select({ companyId: issues.companyId, conversationAgentId: issues.conversationAgentId })
         .from(issues)
-        .where(eq(issues.id, issueId))
-        .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
+        .where(eq(issues.id, issueId));
+      // Caller-owned transactions (including chat and review comments) must
+      // serialize with question creation before inserting the human comment.
+      const issue = await (actor.userId || (actor.runId && dbOrTx !== db) ? issueQuery.for("update") : issueQuery)
+        .then((rows: Array<{ companyId: string; conversationAgentId: string | null }>) => rows[0] ?? null);
 
       if (!issue) throw notFound("Issue not found");
 
+      if (issue.conversationAgentId && actor.userId && !(await instanceSettingsService(dbOrTx).getExperimental()).enableAgentChat) {
+        throw unprocessable("Agent Chat is disabled in Experimental settings");
+      }
       const currentUserRedactionOptions = {
         // Keep every read on the caller's transaction connection. Re-entering
         // the outer pool here can deadlock when concurrent transactions fill
@@ -12110,10 +12532,27 @@ export function issueService(db: Db) {
         enabled: (await instanceSettings.getGeneral({ db: dbOrTx }))
           .censorUsernameInLogs,
       };
-      const redactedBody = redactCurrentUserText(
-        body,
-        currentUserRedactionOptions,
-      );
+      const redactedBody = redactCurrentUserText(body, currentUserRedactionOptions);
+      if (actor.userId && options?.clientRequestId) {
+        const [existing] = await dbOrTx.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+          eq(issueComments.authorUserId, actor.userId), eq(issueComments.clientRequestId, options.clientRequestId)));
+        if (existing) {
+          if (existing.body !== redactedBody) throw conflict("Message request ID was already used for different content");
+          return existing;
+        }
+      }
+      if (issue.conversationAgentId && actor.runId) {
+        const [run] = await dbOrTx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, actor.runId));
+        const [current] = await dbOrTx.select().from(issues).where(eq(issues.id, issueId));
+        if (run?.status === "cancelled") throw conflict("This conversation turn was cancelled; it cannot post a reply");
+        if (run?.contextSnapshot?.conversationSessionGeneration !== current.conversationSessionGeneration) {
+          throw conflict("Conversation session changed; this reply belongs to an earlier session");
+        }
+      }
+      if (options?.completionReply && actor.agentId && actor.runId) {
+        const delivered = await existingChatCompletionReply(dbOrTx, actor.runId, issueId);
+        if (delivered) return redactIssueComment(delivered, currentUserRedactionOptions.enabled);
+      }
       const authorType = issueCommentAuthorTypeSchema.parse(
         options?.authorType ??
           (actor.agentId ? "agent" : actor.userId ? "user" : "system"),
@@ -12123,6 +12562,16 @@ export function issueService(db: Db) {
         .nullable()
         .parse(options?.presentation ?? null);
       const createdAt = options?.createdAt ? new Date(options.createdAt) : null;
+      const validCreatedAt =
+        createdAt && !Number.isNaN(createdAt.getTime()) ? createdAt : null;
+      // Use one statement timestamp for both columns when the caller did not
+      // supply a valid historical timestamp. This keeps the comment's
+      // recency fields equal even when the surrounding transaction started
+      // earlier, while preserving imported timestamps and the normal default
+      // updatedAt behavior for those historical rows.
+      const currentInsertTimestamp = validCreatedAt
+        ? null
+        : sql`statement_timestamp()`;
       // Invalid/stale run ids must not 500 the insert — null out unknowns.
       const createdByRun = await resolveCommentCreatedByRun(
         dbOrTx,
@@ -12278,6 +12727,7 @@ export function issueService(db: Db) {
             !shouldUpgradeAttachmentAuthorization &&
             !shouldBindAttachments
           ) {
+            if (options?.completionReply && actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, existing.id);
             return redactIssueComment(
               existing,
               currentUserRedactionOptions.enabled,
@@ -12324,16 +12774,19 @@ export function issueService(db: Db) {
             authorType,
             createdByRunId,
             body: redactedBody,
+            clientRequestId: options?.clientRequestId ?? null,
             presentation,
             metadata,
             sourceTrust: options?.sourceTrust ?? null,
-            ...(createdAt && !Number.isNaN(createdAt.getTime())
-              ? { createdAt }
+            createdAt: validCreatedAt ?? currentInsertTimestamp!,
+            ...(currentInsertTimestamp
+              ? { updatedAt: currentInsertTimestamp }
               : {}),
           })
           .returning();
       }
       if (!comment) throw new Error("Failed to create issue comment");
+      if (options?.completionReply && actor.agentId && createdByRunId) await acknowledgeChatCompletionReply(dbOrTx, createdByRunId, comment.id);
 
       const boundAttachments: Array<{
         id: string;
@@ -12529,6 +12982,15 @@ export function issueService(db: Db) {
         }
       }
 
+      if (issue.conversationAgentId && actor.userId) {
+        await dbOrTx.update(issues).set({ conversationState: "active" }).where(eq(issues.id, issueId));
+      }
+      if (options?.mirrorToSlack && actor.userId && authorType === "user") {
+        await mirrorSlackBoardComment(dbOrTx, comment, { attachmentIds: options.attachmentIds });
+      }
+      if (authorType === "user" || actor.userId) {
+        await resumeSlackConversation(dbOrTx, issue.companyId, issueId);
+      }
       // Update issue's updatedAt so comment activity is reflected in recency sorting
       await dbOrTx
         .update(issues)
@@ -12547,7 +13009,13 @@ export function issueService(db: Db) {
         // channel" publications use the separate publication path.
         const chatFinalOwnsProviderReply =
           createdByRun !== null &&
-          isExternalChatPresentationContext(createdByRun.contextSnapshot) &&
+          isExternalChatPresentationContext(
+            createdByRun.contextSnapshot,
+            readStringFromRecord(createdByRun.contextSnapshot, "source") === "tool_action_review" &&
+              (await resolveChatOriginPublicationBindings(
+                dbOrTx, issue.companyId, issueId, createdByRunId,
+              )).length > 0,
+          ) &&
           metadata?.authorizationReason !==
             CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON;
         const interactionOwnsProviderReply = createdByRunId

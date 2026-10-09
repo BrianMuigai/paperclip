@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 import { errorHandler } from "../middleware/error-handler.js";
+import { mcpDiscoveryHttpFailure, retainMcpConnectionFailure } from "../services/mcp-connection-failure.js";
 
 const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
 const captureExceptionMock = vi.hoisted(() => vi.fn());
@@ -64,6 +65,24 @@ describe("errorHandler", () => {
     expect(res.__errorContext?.error?.message).toBe("boom");
   });
 
+  it("ends aborted client requests without reporting a crash", () => {
+    // A closed tab or dropped network surfaces as `Error: aborted` with
+    // ECONNRESET; there is no server fault and nobody left to answer.
+    const req = makeReq();
+    const res = { ...makeRes(), end: vi.fn(), headersSent: false } as any;
+    (res.status as ReturnType<typeof vi.fn>).mockReturnValue(res);
+    const next = vi.fn() as unknown as NextFunction;
+    const err = Object.assign(new Error("aborted"), { code: "ECONNRESET" });
+
+    errorHandler(err, req, res, next);
+
+    expect(res.status).toHaveBeenCalledWith(499);
+    expect(res.end).toHaveBeenCalled();
+    expect(res.json).not.toHaveBeenCalled();
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+    expect(telemetryMocks.trackErrorHandlerCrash).not.toHaveBeenCalled();
+  });
+
   it("exposes raw 500 messages for trusted Cloud tenant imports", () => {
     const req = {
       ...makeReq(),
@@ -101,6 +120,35 @@ describe("errorHandler", () => {
     expect(res.json).toHaveBeenCalledWith({ error: "db exploded" });
     expect(res.err).toBe(err);
     expect(res.__errorContext?.error?.message).toBe("db exploded");
+  });
+
+  it("keeps HTTP failures and existing telemetry for proven external MCP outages while skipping Sentry", () => {
+    const req = makeReq();
+    const res = makeRes() as any;
+    const original = mcpDiscoveryHttpFailure(new Response(null, { status: 503 }), "Remote app returned HTTP 503");
+    const err = retainMcpConnectionFailure(original, new HttpError(502, original.message));
+
+    errorHandler(err, req, res, vi.fn());
+
+    expect(res.status).toHaveBeenCalledWith(502);
+    expect(res.json).toHaveBeenCalledWith({ error: original.message });
+    expect(res.err).toBe(err);
+    expect(res.__errorContext.error.message).toBe(original.message);
+    expect(telemetryMocks.trackErrorHandlerCrash).toHaveBeenCalledOnce();
+    expect(captureExceptionMock).not.toHaveBeenCalled();
+  });
+
+  it("reports copied connection markers and unrelated database failures", () => {
+    for (const err of [
+      Object.assign(new HttpError(502, "Remote app returned HTTP 503", { status: 503 }), {
+        connectionFailure: { schemaVersion: 1, provider: "mcp_http", operation: "discover_tools", reason: "remote_unavailable" },
+      }),
+      new HttpError(500, "database unavailable"),
+    ]) {
+      errorHandler(err, makeReq(), makeRes(), vi.fn());
+    }
+    expect(captureExceptionMock).toHaveBeenCalledTimes(2);
+    expect(telemetryMocks.trackErrorHandlerCrash).toHaveBeenCalledTimes(2);
   });
 
   it("sanitizes chat setup errors before logs and crash reporting", () => {
